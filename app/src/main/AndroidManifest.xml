@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- For Android 12 (API 32) and below -->
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+    <!-- For Android 13 (API 33) and above, for video access -->
+    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
+    <!-- If you plan to save the processed video to public storage, you'll need WRITE permission too -->
+    <!-- For Android 9 (API 28) and below -->
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28" />
+    <!--
+        For Android 10 (API 29) and above, writing to public shared storage is restricted.
+        You'd typically use MediaStore API or Scoped Storage, which doesn't always require
+        WRITE_EXTERNAL_STORAGE for your app's own files or files in specific media collections.
+        If you save to app-specific directory, no explicit write permission is needed.
+    -->
+
+
+    <application
+        android:allowBackup="true"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="@xml/backup_rules"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.LMF_CNN"
+        tools:targetApi="31">
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+
+</manifest>

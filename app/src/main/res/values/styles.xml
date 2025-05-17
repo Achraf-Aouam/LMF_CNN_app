@@ -1,0 +1,6 @@
+<!-- styles.xml -->
+<resources>
+    <style name="Theme.LMF_CNN" parent="Theme.AppCompat.Light.DarkActionBar">
+        <!-- Customize your theme here. -->
+    </style>
+</resources>
