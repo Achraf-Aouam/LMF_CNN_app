@@ -76,7 +76,10 @@ dependencies {
     debugImplementation(libs.androidx.ui.tooling)
     debugImplementation(libs.androidx.ui.test.manifest)
     // PyTorch Mobile Lite (core)
-    implementation("org.pytorch:pytorch_android:1.13.1") // Or latest stable version
+    implementation("org.pytorch:pytorch_android:2.1.0") // Or latest stable version
     // PyTorch Mobile TorchVision Lite
-    implementation("org.pytorch:pytorch_android_torchvision:1.13.1") // Match version with core
+    implementation("org.pytorch:pytorch_android_torchvision:2.1.0") // Match version with core
+
+    implementation ("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.7.3") // Or latest
+    implementation ("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3") // Or latest
 }
