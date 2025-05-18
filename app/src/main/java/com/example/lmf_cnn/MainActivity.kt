@@ -44,7 +44,17 @@ import android.widget.AdapterView // For Spinner
 import android.widget.ArrayAdapter // For Spinner
 import android.widget.Spinner        // For Spinner
 import org.pytorch.Device
-//import org.pytorch.LiteModuleLoader
+import android.media.MediaCodec
+import android.media.MediaCodecInfo
+import android.media.MediaExtractor
+import android.media.MediaFormat
+import android.media.Image // For converting YUV to RGB
+import android.renderscript.RenderScript // For YUV to RGB conversion (optional, API level dependent)
+import java.nio.ByteBuffer // For MediaCodec buffers
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.isActive
 
 // Constants for video processing
 private const val TARGET_LR_HEIGHT = 120
@@ -53,6 +63,15 @@ private const val TARGET_LR_HEIGHT = 120
 // For the model, it expects 214 width for 120 height.
 private const val TARGET_LR_WIDTH_FOR_MODEL = 214
 private const val UPSCALE_FACTOR = 4 // From your model
+private const val PREPROCESSED_FRAME_CHANNEL_CAPACITY = 10 // Adjust as needed
+private const val INFERENCE_INPUT_CHANNEL_CAPACITY = 5  // Adjust as needed
+private const val PROCESSED_BITMAP_CHANNEL_CAPACITY = 10 // Adjust as needed
+private const val INFERENCE_BATCH_SIZE = 2 // Define batch size for inference
+
+// Data class to hold a triplet of bitmaps for inference
+data class FrameTriplet(val f1: Bitmap, val f2: Bitmap, val f3: Bitmap, val originalFrameIndex: Int)
+// Data class to hold the output of inference
+data class InferenceOutput(val hrBitmap: Bitmap, val originalFrameIndex: Int)
 
 class MainActivity : AppCompatActivity() {
 
@@ -129,7 +148,7 @@ class MainActivity : AppCompatActivity() {
 
 
     private fun setupDeviceSpinner() {
-        val devices = arrayOf("CPU", "GPU (Vulkan)" )
+        val devices = arrayOf("CPU", "GPU (Vulkan)", "NNAPI") // Added NNAPI
         val adapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, devices)
         adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
         spinnerDeviceSelection.adapter = adapter
@@ -138,7 +157,6 @@ class MainActivity : AppCompatActivity() {
             override fun onItemSelected(parent: AdapterView<*>, view: View?, position: Int, id: Long) {
                 val newSelectedDeviceEnum = when (position) {
                     1 -> Device.VULKAN
-//                    2 -> Device.NNAPI
                     else -> Device.CPU
                 }
 
@@ -198,238 +216,342 @@ class MainActivity : AppCompatActivity() {
         return resultBitmap
     }
 
-    // --- Video Processing Core Logic (will be expanded) ---
+    // --- Video Processing Core Logic ---
     private suspend fun processVideo(videoUri: Uri) {
-        Log.d("ProcessVideo", "Starting video processing for URI: $videoUri  on $selectedDevice")
-        var lrVideoPath: String? = null
-        var hrVideoPath: String? = null
+        Log.d("ProcessVideo", "Starting video processing for URI: $videoUri on $selectedDevice with Coroutine Channels")
+
+        // Channels for communication between coroutines
+        val preprocessedFrameChannel = Channel<Bitmap>(PREPROCESSED_FRAME_CHANNEL_CAPACITY)
+        val inferenceInputChannel = Channel<FrameTriplet>(INFERENCE_INPUT_CHANNEL_CAPACITY)
+        val processedBitmapChannel = Channel<InferenceOutput>(PROCESSED_BITMAP_CHANNEL_CAPACITY)
+
+        var videoProcessingJob: Job? = null
+        var frameConsumptionJob: Job? = null
+        var inferenceJob: Job? = null
+        var savingJob: Job? = null
 
         try {
-            // This will run on a background thread (Dispatchers.IO)
-            withContext(Dispatchers.IO) {
-                val retriever = MediaMetadataRetriever()
+            // Launch a parent job for all processing steps to manage cancellation
+            videoProcessingJob = lifecycleScope.launch(Dispatchers.IO) {
+                val extractor = MediaExtractor()
+                var decoder: MediaCodec? = null
+                var totalFramesEstimate = 0
+                var frameRate = 30
+
                 try {
-                    retriever.setDataSource(this@MainActivity, videoUri)
-
-                    val originalWidthStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)
-                    val originalHeightStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)
-                    val durationStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
-                    val frameRateStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_CAPTURE_FRAMERATE) // May be null
-
-                    if (originalWidthStr == null || originalHeightStr == null || durationStr == null) {
-                        Log.e("ProcessVideo", "Failed to extract video metadata.")
-                        updateUiOnError("Failed to get video metadata.")
-                        return@withContext
-                    }
-
-                    val originalWidth = originalWidthStr.toInt()
-                    val originalHeight = originalHeightStr.toInt()
-                    val durationMs = durationStr.toLong()
-                    // Estimate frame rate if not available, default to 25 or 30
-                    val frameRate = frameRateStr?.toFloatOrNull() ?: 30f
-                    val frameIntervalUs = (1_000_000 / frameRate).toLong() // Microseconds
-
-                    Log.i("ProcessVideo", "Original Video: ${originalWidth}x${originalHeight}, Duration: ${durationMs}ms, FPS: $frameRate")
-                    updateUiStatus("Video Info: ${originalWidth}x${originalHeight}, ${durationMs / 1000}s")
-
-                    // Calculate LR dimensions maintaining aspect ratio, targeting TARGET_LR_HEIGHT
-                    val aspectRatio = originalWidth.toFloat() / originalHeight.toFloat()
-                    val lrHeight = TARGET_LR_HEIGHT
-                    val lrWidth = (lrHeight * aspectRatio).roundToInt()
-                    Log.i("ProcessVideo", "Target LR dimensions (aspect preserved): ${lrWidth}x${lrHeight}")
-
-
-                    // --- Frame Buffer for Model Input ---
-                    // Model expects 3 consecutive frames. We'll use a circular buffer or list.
-                    val lrFrameBuffer = mutableListOf<Bitmap>()
-                    val processedHrFrames = mutableListOf<Bitmap>() // To store output HR frames
-
-                    var currentFrameTimeUs = 0L
-                    var framesProcessed = 0
-                    val totalFramesEstimate = (durationMs / 1000 * frameRate).toInt()
-
-                    // Loop to extract frames
-                    // MediaMetadataRetriever.getFrameAtTime is okay for a few frames, but inefficient for many.
-                    // For full video, MediaCodec/MediaExtractor is better.
-                    // We'll simulate frame-by-frame processing for now.
-
-                    // --- Part 1: Frame Extraction, Downscaling, and Input Tensor Preparation ---
-                    while (currentFrameTimeUs < durationMs * 1000) {
-                        // Extract frame
-                        // OPTION_CLOSEST_SYNC is faster but less accurate. OPTION_CLOSEST for more precision.
-                        val originalFrameBitmap = retriever.getFrameAtTime(currentFrameTimeUs, MediaMetadataRetriever.OPTION_CLOSEST)
-                        if (originalFrameBitmap == null) {
-                            Log.w("ProcessVideo", "Could not retrieve frame at ${currentFrameTimeUs / 1000}ms. Skipping.")
-                            currentFrameTimeUs += frameIntervalUs
-                            if (currentFrameTimeUs > durationMs * 1000 && lrFrameBuffer.size < 3 && lrFrameBuffer.isNotEmpty()) {
-                                // If near end and buffer not full, pad with last frame (simplistic)
-                                Log.d("ProcessVideo", "Padding buffer with last frame at end of video")
-                                while(lrFrameBuffer.size < 3 && lrFrameBuffer.isNotEmpty()) {
-                                    lrFrameBuffer.add(lrFrameBuffer.last().copy(lrFrameBuffer.last().config ?: Bitmap.Config.ARGB_8888 , true))
+                    // --- Stage 1: Frame Extraction and Preprocessing Coroutine ---
+                    launch {
+                        Log.d("ProcessVideo", "[DecoderCoroutine] Starting")
+                        try {
+                            extractor.setDataSource(this@MainActivity, videoUri, null)
+                            var trackIndex = -1
+                            var videoFormat: MediaFormat? = null
+                            for (i in 0 until extractor.trackCount) {
+                                val format = extractor.getTrackFormat(i)
+                                val mime = format.getString(MediaFormat.KEY_MIME)
+                                if (mime?.startsWith("video/") == true) {
+                                    videoFormat = format
+                                    trackIndex = i
+                                    extractor.selectTrack(trackIndex)
+                                    break
                                 }
-                            } else if (originalFrameBitmap == null && currentFrameTimeUs > durationMs * 1000) {
-                                break // End of video
                             }
-                            continue
+
+                            if (trackIndex == -1 || videoFormat == null) {
+                                updateUiOnError("No video track found.")
+                                preprocessedFrameChannel.close(IllegalStateException("No video track"))
+                                return@launch
+                            }
+
+                            val originalWidth = videoFormat.getInteger(MediaFormat.KEY_WIDTH)
+                            val originalHeight = videoFormat.getInteger(MediaFormat.KEY_HEIGHT)
+                            val durationUs = videoFormat.getLong(MediaFormat.KEY_DURATION)
+                            frameRate = videoFormat.getInteger(MediaFormat.KEY_FRAME_RATE, 30)
+                            totalFramesEstimate = (durationUs / 1000000 * frameRate).toInt()
+
+                            updateUiStatus("Video: ${originalWidth}x${originalHeight}, ${durationUs / 1000000}s, $frameRate FPS")
+
+                            val mimeType = videoFormat.getString(MediaFormat.KEY_MIME)!!
+                            decoder = MediaCodec.createDecoderByType(mimeType)
+                            decoder!!.configure(videoFormat, null, null, 0)
+                            decoder!!.start()
+
+                            val bufferInfo = MediaCodec.BufferInfo()
+                            var isDecoderEOS = false
+                            var decodedFrameCount = 0
+
+                            while (!isDecoderEOS && isActive) {
+                                val inputBufferIndex = decoder!!.dequeueInputBuffer(10000) // 10ms
+                                if (inputBufferIndex >= 0) {
+                                    val inputBuffer = decoder!!.getInputBuffer(inputBufferIndex)
+                                    val sampleSize = extractor.readSampleData(inputBuffer!!, 0)
+                                    if (sampleSize < 0) {
+                                        decoder!!.queueInputBuffer(inputBufferIndex, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                                        isDecoderEOS = true
+                                    } else {
+                                        decoder!!.queueInputBuffer(inputBufferIndex, 0, sampleSize, extractor.sampleTime, 0)
+                                        extractor.advance()
+                                    }
+                                }
+
+                                val outputBufferIndex = decoder!!.dequeueOutputBuffer(bufferInfo, 10000) // 10ms
+                                if (outputBufferIndex >= 0) {
+                                    val image = decoder!!.getOutputImage(outputBufferIndex)
+                                    if (image != null) {
+                                        val originalFrameBitmap = imageToBitmap(image) // Handles image.close()
+                                        val modelInputLrBitmap = resizeAndCenterPad(originalFrameBitmap, TARGET_LR_WIDTH_FOR_MODEL, TARGET_LR_HEIGHT)
+                                        originalFrameBitmap.recycle()
+                                        preprocessedFrameChannel.send(modelInputLrBitmap) // Send to next stage
+                                        decodedFrameCount++
+                                    }
+                                    decoder!!.releaseOutputBuffer(outputBufferIndex, false)
+                                    if ((bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
+                                        isDecoderEOS = true
+                                    }
+                                }
+                            }
+                            Log.d("ProcessVideo", "[DecoderCoroutine] Finished. Decoded $decodedFrameCount frames.")
+                        } catch (e: Exception) {
+                            Log.e("ProcessVideo", "[DecoderCoroutine] Error", e)
+                            preprocessedFrameChannel.close(e)
+                        } finally {
+                            decoder?.stop()
+                            decoder?.release()
+                            extractor.release()
+                            preprocessedFrameChannel.close() // Signal end of frames
+                            Log.d("ProcessVideo", "[DecoderCoroutine] Cleaned up and closed channel.")
+                        }
+                    } // End of Decoder Coroutine
+
+                    // --- Stage 2: Frame Triplet Formation Coroutine ---
+                    frameConsumptionJob = launch {
+                        Log.d("ProcessVideo", "[TripletFormationCoroutine] Starting")
+                        val lrFrameBuffer = mutableListOf<Bitmap>()
+                        var frameCounter = 0
+                        try {
+                            for (bitmap in preprocessedFrameChannel) { // Consume from channel
+                                if (!isActive) break
+                                lrFrameBuffer.add(bitmap)
+                                if (lrFrameBuffer.size == 3) {
+                                    val triplet = FrameTriplet(lrFrameBuffer[0], lrFrameBuffer[1], lrFrameBuffer[2], frameCounter - 2) // originalFrameIndex is for the middle frame
+                                    inferenceInputChannel.send(triplet)
+                                    lrFrameBuffer.removeAt(0) // Keep buffer sliding (don't recycle here, inference needs it)
+                                }
+                                frameCounter++
+                            }
+                            // Handle remaining frames at EOS if any (padding)
+                            if (lrFrameBuffer.isNotEmpty() && lrFrameBuffer.size < 3) {
+                                Log.d("ProcessVideo", "[TripletFormationCoroutine] Padding last triplet.")
+                                val lastFrame = lrFrameBuffer.last()
+                                while (lrFrameBuffer.size < 3 && lrFrameBuffer.isNotEmpty()) {
+                                    lrFrameBuffer.add(lastFrame.copy(lastFrame.config ?: Bitmap.Config.ARGB_8888, true))
+                                }
+                                if(lrFrameBuffer.size == 3){
+                                    val triplet = FrameTriplet(lrFrameBuffer[0], lrFrameBuffer[1], lrFrameBuffer[2], frameCounter - lrFrameBuffer.size)
+                                    inferenceInputChannel.send(triplet)
+                                }
+                            }
+                            Log.d("ProcessVideo", "[TripletFormationCoroutine] Finished. Processed $frameCounter input frames.")
+                        } catch (e: Exception) {
+                            Log.e("ProcessVideo", "[TripletFormationCoroutine] Error", e)
+                            inferenceInputChannel.close(e)
+                        } finally {
+                            inferenceInputChannel.close()
+                            // Recycle any remaining bitmaps in lrFrameBuffer if not sent
+                            lrFrameBuffer.forEach { if (!it.isRecycled) it.recycle() }
+                            Log.d("ProcessVideo", "[TripletFormationCoroutine] Cleaned up and closed channel.")
+                        }
+                    } // End of Frame Triplet Formation Coroutine
+
+                    // Helper function within processVideo scope to handle batch processing logic
+                    suspend fun CoroutineScope.processBatch(
+                        batch: List<FrameTriplet>,
+                        totalFramesEstimate: Int,
+                        tripletsProcessed: Int // Renamed to avoid conflict
+                    ) {
+                        if (batch.isEmpty() || !isActive) return
+
+                        updateUiStatus("Inferring batch of ${batch.size} (total processed: $tripletsProcessed)...")
+
+                        val mean = floatArrayOf(0.5f, 0.5f, 0.5f)
+                        val std = floatArrayOf(0.5f, 0.5f, 0.5f)
+                        val h = TARGET_LR_HEIGHT
+                        val w = TARGET_LR_WIDTH_FOR_MODEL
+                        val channelsPerTriplet = 9
+                        val numImagesInBatch = batch.size
+
+                        // Combined float array for the entire batch
+                        val batchCombinedFloats = FloatArray(numImagesInBatch * channelsPerTriplet * h * w)
+                        var currentBatchDestPos = 0
+
+                        batch.forEachIndexed { index, triplet ->
+                            val tensor1 = TensorImageUtils.bitmapToFloat32Tensor(triplet.f1, mean, std)
+                            val tensor2 = TensorImageUtils.bitmapToFloat32Tensor(triplet.f2, mean, std)
+                            val tensor3 = TensorImageUtils.bitmapToFloat32Tensor(triplet.f3, mean, std)
+
+                            // Recycle f1 of each triplet. f2 and f3 are managed by TripletFormationCoroutine's finally block.
+                            if (!triplet.f1.isRecycled) triplet.f1.recycle()
+                            // DO NOT recycle triplet.f2 or triplet.f3 here as they might be f1/f2 of the *next* triplet in the list
+                            // if INFERENCE_BATCH_SIZE > 1 and they were part of the lrFrameBuffer sliding window.
+                            // The TripletFormationCoroutine's finally block is the safest place for f2, f3 from the original buffer.
+
+                            val tripletFloats1 = tensor1.dataAsFloatArray
+                            val tripletFloats2 = tensor2.dataAsFloatArray
+                            val tripletFloats3 = tensor3.dataAsFloatArray
+
+                            // Concatenate channels for one triplet
+                            System.arraycopy(tripletFloats1, 0, batchCombinedFloats, currentBatchDestPos, tripletFloats1.size)
+                            currentBatchDestPos += tripletFloats1.size
+                            System.arraycopy(tripletFloats2, 0, batchCombinedFloats, currentBatchDestPos, tripletFloats2.size)
+                            currentBatchDestPos += tripletFloats2.size
+                            System.arraycopy(tripletFloats3, 0, batchCombinedFloats, currentBatchDestPos, tripletFloats3.size)
+                            currentBatchDestPos += tripletFloats3.size
                         }
 
-                        // Downscale frame to LR (e.g., 214x120 for the model)
-                        // Important: The model was trained on LR images of a specific size.
-                        // We need to resize AND potentially crop to match 214x120.
-                        // Let's resize to lrHeight (120) maintaining aspect, then center crop to TARGET_LR_WIDTH_FOR_MODEL (214).
-                        val resizedLrBitmap = resizeBitmap(originalFrameBitmap, lrWidth, lrHeight)
-                        val modelInputLrBitmap = resizeAndCenterPad(originalFrameBitmap!!, TARGET_LR_WIDTH_FOR_MODEL, TARGET_LR_HEIGHT)
-                        originalFrameBitmap.recycle() // Important to free memory
-                        resizedLrBitmap.recycle() // If different from modelInputLrBitmap
+                        val inputTensor = Tensor.fromBlob(batchCombinedFloats, longArrayOf(numImagesInBatch.toLong(), channelsPerTriplet.toLong(), h.toLong(), w.toLong()))
 
-                        lrFrameBuffer.add(modelInputLrBitmap)
+                        val startTime = System.nanoTime()
+                        val outputBatchTensor = pytorchModule!!.forward(IValue.from(inputTensor)).toTensor()
+                        val inferenceDurationMs = (System.nanoTime() - startTime) / 1_000_000.0
+                        Log.d("Performance", "Inference for batch of $numImagesInBatch on $selectedDevice: $inferenceDurationMs ms (avg: ${inferenceDurationMs/numImagesInBatch} ms/triplet)")
 
-                        // If we have 3 frames in the buffer, process them
-                        if (lrFrameBuffer.size == 3) {
-                            updateUiStatus("Processing frame triplet ${framesProcessed + 1}...")
-                            // --- Part 2: Preprocess for Model & Inference ---
-                            // Concatenate 3 LR frames (Bitmaps) into one 9-channel Tensor
-                            // Normalization: [-1, 1] as per your training
-                            val mean = floatArrayOf(0.5f, 0.5f, 0.5f)
-                            val std = floatArrayOf(0.5f, 0.5f, 0.5f)
+                        val outputBatchFloatTensor = outputBatchTensor.dataAsFloatArray
+                        // Expected shape: [numImagesInBatch, 3, H_out, W_out]
+                        val outChannels = 3
+                        val outHeight = TARGET_LR_HEIGHT * UPSCALE_FACTOR
+                        val outWidth = TARGET_LR_WIDTH_FOR_MODEL * UPSCALE_FACTOR
+                        val floatsPerHrImage = outChannels * outHeight * outWidth
 
-                            // Convert each bitmap to a 3-channel tensor and then stack
-                            val tensor1 = TensorImageUtils.bitmapToFloat32Tensor(lrFrameBuffer[0], mean, std)
-                            val tensor2 = TensorImageUtils.bitmapToFloat32Tensor(lrFrameBuffer[1], mean, std)
-                            val tensor3 = TensorImageUtils.bitmapToFloat32Tensor(lrFrameBuffer[2], mean, std)
+                        for (i in 0 until numImagesInBatch) {
+                            if (!isActive) break // Check for cancellation before processing each item in batch
 
-                            // Input tensor shape should be [1, 9, H, W]
-                            // H = TARGET_LR_HEIGHT (120), W = TARGET_LR_WIDTH_FOR_MODEL (214)
-//                            val inputTensor = Tensor.cat(arrayOf(tensor1, tensor2, tensor3), 1) // Concatenate along channel dim
-//                                .reshape(1, 9, TARGET_LR_HEIGHT, TARGET_LR_WIDTH_FOR_MODEL)
-
-                            val h = TARGET_LR_HEIGHT
-                            val w = TARGET_LR_WIDTH_FOR_MODEL
-                            val cPerTensor = 3 // Channels per individual frame tensor
-                            val numTensors = 3 // Number of frames to stack
-
-                            val totalChannels = cPerTensor * numTensors // Should be 9
-
-// Get data from individual tensors
-                            val floats1 = tensor1.dataAsFloatArray // Expected size: 1 * 3 * H * W
-                            val floats2 = tensor2.dataAsFloatArray
-                            val floats3 = tensor3.dataAsFloatArray
-
-// Create a new float array to hold the combined data
-                            val combinedFloats = FloatArray(1 * totalChannels * h * w) // Batch_size = 1
-
-                            var destPos = 0
-// Copy data from tensor1 (all its channels)
-                            System.arraycopy(floats1, 0, combinedFloats, destPos, floats1.size)
-                            destPos += floats1.size
-// Copy data from tensor2
-                            System.arraycopy(floats2, 0, combinedFloats, destPos, floats2.size)
-                            destPos += floats2.size
-// Copy data from tensor3
-                            System.arraycopy(floats3, 0, combinedFloats, destPos, floats3.size)
-
-                            val inputTensor = Tensor.fromBlob(combinedFloats, longArrayOf(1, totalChannels.toLong(), h.toLong(), w.toLong()))
-                            // --- Run Inference ---
-                            val startTime = System.nanoTime()
-                            val outputTensor = pytorchModule!!.forward(IValue.from(inputTensor)).toTensor()
-                            val endTime = System.nanoTime()
-                            val durationMs = (endTime - startTime) / 1_000_000.0
-                            Log.d("Performance", "Inference for one triplet on $selectedDevice: $durationMs ms")
-                            // Output tensor shape: [1, 3, H_out, W_out]
-                            // H_out = 120 * 4 = 480, W_out = 214 * 4 = 856
-
-                            // --- Part 3: Postprocess Output Tensor to Bitmap ---
-                            // Denormalize from [-1, 1] back to [0, 1] then to Bitmap [0, 255]
-                            // For denormalization, if input was (x - 0.5) / 0.5, output is y * 0.5 + 0.5
-                            val outputFloatTensor = outputTensor.dataAsFloatArray
-                            // Expected output shape: [1, 3, 480, 856]
-                            val outChannels = 3
-                            val outHeight = TARGET_LR_HEIGHT * UPSCALE_FACTOR
-                            val outWidth = TARGET_LR_WIDTH_FOR_MODEL * UPSCALE_FACTOR
-
-                            // Create a new bitmap for the output
+                            val triplet = batch[i]
                             val outputHrBitmap = Bitmap.createBitmap(outWidth, outHeight, Bitmap.Config.ARGB_8888)
-                            val intPixels = IntArray(outWidth * outHeight) // Array to hold ARGB pixel values
-                            // Manually denormalize and fill bitmap pixels
-                            // This is a bit verbose; TensorImageUtils might have a direct way for this too,
-                            // but let's be explicit for denormalization.
-                            // PyTorch tensor is CHW, Bitmap is row-major (Height then Width)
+                            val intPixels = IntArray(outWidth * outHeight)
+                            val hrImageFloatOffset = i * floatsPerHrImage
+
                             for (y in 0 until outHeight) {
                                 for (x in 0 until outWidth) {
-                                    // Indices for R, G, B channels in the flat float array (CHW format)
-                                    val rIndex = (0 * outHeight + y) * outWidth + x
-                                    val gIndex = (1 * outHeight + y) * outWidth + x
-                                    val bIndex = (2 * outHeight + y) * outWidth + x
+                                    val rIdx = hrImageFloatOffset + (0 * outHeight + y) * outWidth + x
+                                    val gIdx = hrImageFloatOffset + (1 * outHeight + y) * outWidth + x
+                                    val bIdx = hrImageFloatOffset + (2 * outHeight + y) * outWidth + x
 
-                                    // Denormalize: from [-1, 1] to [0, 1], then to [0, 255]
-                                    val r = ((outputFloatTensor[rIndex] * 0.5f + 0.5f) * 255f).toInt().coerceIn(0, 255)
-                                    val g = ((outputFloatTensor[gIndex] * 0.5f + 0.5f) * 255f).toInt().coerceIn(0, 255)
-                                    val b = ((outputFloatTensor[bIndex] * 0.5f + 0.5f) * 255f).toInt().coerceIn(0, 255)
-
-                                    intPixels[y * outWidth + x] = android.graphics.Color.rgb(r, g, b) // Or Color.argb(255, r, g, b)
+                                    val r = ((outputBatchFloatTensor[rIdx] * 0.5f + 0.5f) * 255f).toInt().coerceIn(0, 255)
+                                    val g = ((outputBatchFloatTensor[gIdx] * 0.5f + 0.5f) * 255f).toInt().coerceIn(0, 255)
+                                    val b = ((outputBatchFloatTensor[bIdx] * 0.5f + 0.5f) * 255f).toInt().coerceIn(0, 255)
+                                    intPixels[y * outWidth + x] = android.graphics.Color.rgb(r, g, b)
                                 }
                             }
                             outputHrBitmap.setPixels(intPixels, 0, outWidth, 0, 0, outWidth, outHeight)
-                            processedHrFrames.add(outputHrBitmap)
+                            processedBitmapChannel.send(InferenceOutput(outputHrBitmap, triplet.originalFrameIndex))
 
-                            // Remove the oldest frame from the buffer to slide the window
-//                            lrFrameBuffer.removeAt(0).recycle() // Recycle the removed bitmap
-                            val removedBitmap = lrFrameBuffer.removeAt(0)
-                            removedBitmap.recycle() // Recycle the removed bitmap
-                            framesProcessed++
-                            updateUiProgress((framesProcessed * 100) / totalFramesEstimate)
-                        }
-                        currentFrameTimeUs += frameIntervalUs
-                    } // End of while loop for frames
-
-                    retriever.release() // Release the retriever
-
-                    // --- Part 4: Save LR Video (if desired) & Re-stitch HR Video ---
-                    // This part is complex. Saving frame-by-frame extracted bitmaps to a video
-                    // requires MediaMuxer and MediaCodec (for encoding).
-                    // For simplicity, we'll just log that we have the HR frames.
-                    // Actual video saving is a significant step.
-
-                    if (processedHrFrames.isNotEmpty()) {
-                        updateUiStatus("Saving ${processedHrFrames.size} processed HR frames...")
-                        val outputDir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "LMF_CNN_Output")
-                        if (!outputDir.exists()) {
-                            outputDir.mkdirs()
-                        }
-
-                        processedHrFrames.forEachIndexed { index, bmp ->
-                            val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-                            val fileName = "hr_frame_${timestamp}_${String.format("%03d", index)}.png"
-                            val savedPath = saveBitmapToSpecificDirectory(this@MainActivity, bmp, outputDir, fileName)
-                            if (savedPath != null) {
-                                Log.i("ProcessVideo", "Saved HR frame to: $savedPath")
-                            } else {
-                                Log.e("ProcessVideo", "Failed to save HR frame $index")
+                            if (totalFramesEstimate > 0) {
+                                val currentTotalProcessed = tripletsProcessed + i + 1
+                                updateUiProgress((currentTotalProcessed * 100) / (totalFramesEstimate - 2).coerceAtLeast(1))
                             }
-                            // bmp.recycle() // Recycle here if you don't need the bitmaps in memory anymore
                         }
-                        updateUiStatus("${processedHrFrames.size} HR frames saved to Downloads/LMF_CNN_Output.")
-
-                        // Clean up processed HR frames if you are done with them
-                        processedHrFrames.forEach { it.recycle() }
-                        processedHrFrames.clear()
-
-                    } else {
-                        updateUiStatus("No frames were processed.")
                     }
 
+                    // --- Stage 3: Inference Coroutine ---
+                    inferenceJob = launch(Dispatchers.Default) { // Can use Dispatchers.Default or a dedicated context for compute
+                        Log.d("ProcessVideo", "[InferenceCoroutine] Starting on $selectedDevice with batch size $INFERENCE_BATCH_SIZE")
+                        var totalTripletsProcessed = 0
+                        val tripletBatch = mutableListOf<FrameTriplet>()
+
+                        try {
+                            for (triplet in inferenceInputChannel) { // Consume from channel
+                                if (!isActive) break
+                                tripletBatch.add(triplet)
+
+                                if (tripletBatch.size >= INFERENCE_BATCH_SIZE) {
+                                    processBatch(tripletBatch, totalFramesEstimate, tripletsProcessed = totalTripletsProcessed)
+                                    totalTripletsProcessed += tripletBatch.size
+                                    tripletBatch.clear()
+                                }
+                            }
+                            // Process any remaining triplets in the batch after the channel is closed
+                            if (tripletBatch.isNotEmpty() && isActive) {
+                                Log.d("ProcessVideo", "[InferenceCoroutine] Processing remaining ${tripletBatch.size} triplets.")
+                                processBatch(tripletBatch, totalFramesEstimate, tripletsProcessed = totalTripletsProcessed)
+                                totalTripletsProcessed += tripletBatch.size
+                                tripletBatch.clear()
+                            }
+                            Log.d("ProcessVideo", "[InferenceCoroutine] Finished. Processed $totalTripletsProcessed triplets in total.")
+                        } catch (e: Exception) {
+                            Log.e("ProcessVideo", "[InferenceCoroutine] Error", e)
+                            processedBitmapChannel.close(e)
+                            // Recycle any bitmaps in a pending batch if an error occurs
+                            tripletBatch.forEach { t ->
+                                if (!t.f1.isRecycled) t.f1.recycle()
+                                if (!t.f2.isRecycled) t.f2.recycle()
+                                if (!t.f3.isRecycled) t.f3.recycle()
+                            }
+                        } finally {
+                            processedBitmapChannel.close()
+                            Log.d("ProcessVideo", "[InferenceCoroutine] Cleaned up and closed channel.")
+                        }
+                    } // End of Inference Coroutine
+
+                    // --- Stage 4: Saving/Display Coroutine ---
+                    savingJob = launch {
+                        Log.d("ProcessVideo", "[SavingCoroutine] Starting")
+                        val outputDir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "LMF_CNN_Output_Parallel")
+                        if (!outputDir.exists()) outputDir.mkdirs()
+                        var savedFrameCount = 0
+                        val receivedFrames = mutableListOf<InferenceOutput>()
+
+                        try {
+                            for (output in processedBitmapChannel) { // Consume from channel
+                                if (!isActive) break
+                                receivedFrames.add(output)
+                            }
+                            // Sort frames by original index before saving to maintain order
+                            receivedFrames.sortBy { it.originalFrameIndex }
+
+                            updateUiStatus("Saving ${receivedFrames.size} processed HR frames...")
+                            receivedFrames.forEach { inferenceOut ->
+                                val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+                                val fileName = "hr_frame_${timestamp}_${String.format("%04d", inferenceOut.originalFrameIndex)}.png"
+                                saveBitmapToSpecificDirectory(this@MainActivity, inferenceOut.hrBitmap, outputDir, fileName)
+                                inferenceOut.hrBitmap.recycle() // Recycle after saving
+                                savedFrameCount++
+                            }
+                            updateUiStatus("$savedFrameCount HR frames saved to ${outputDir.name}.")
+                            Log.d("ProcessVideo", "[SavingCoroutine] Finished. Saved $savedFrameCount frames.")
+                        } catch (e: Exception) {
+                            Log.e("ProcessVideo", "[SavingCoroutine] Error", e)
+                        } finally {
+                            // Ensure any remaining bitmaps are recycled if an error occurred before saving all
+                            receivedFrames.forEach { if (!it.hrBitmap.isRecycled) it.hrBitmap.recycle() } // Fixed: Call recycle on hrBitmap
+                            Log.d("ProcessVideo", "[SavingCoroutine] Cleaned up.")
+                        }
+                    } // End of Saving Coroutine
+
+                    // Wait for all stages to complete
+                    // The individual coroutines launched within this scope will be joined automatically
+                    // when the parent `videoProcessingJob` (this launch block) completes.
+
                 } catch (e: Exception) {
-                    Log.e("ProcessVideo", "Error during video processing", e)
+                    Log.e("ProcessVideo", "Error in main processing setup", e)
                     updateUiOnError("Error: ${e.localizedMessage}")
+                    // Ensure channels are closed if an error happens before coroutines are launched properly
+                    preprocessedFrameChannel.close(e)
+                    inferenceInputChannel.close(e)
+                    processedBitmapChannel.close(e)
                 } finally {
-                    retriever.release()
+                    Log.d("ProcessVideo", "All processing stages launched. Waiting for completion.")
                 }
-            } // end withContext(Dispatchers.IO)
+            } // End of videoProcessingJob (parent launch)
+
+            videoProcessingJob?.join() // Wait for the entire pipeline to complete
+            Log.i("ProcessVideo", "Video processing fully completed.")
+            updateUiStatus("Video processing finished!")
+
         } catch (e: Exception) {
-            Log.e("ProcessVideo", "Outer error in processVideo coroutine", e)
+            Log.e("ProcessVideo", "Outer error in processVideo coroutine with channels", e)
             updateUiOnError("General Error: ${e.localizedMessage}")
         } finally {
-            // Re-enable UI elements on the main thread
+            // Ensure UI is re-enabled
             withContext(Dispatchers.Main) {
                 progressBar.visibility = View.GONE
                 buttonProcessVideo.isEnabled = true
@@ -467,12 +589,57 @@ class MainActivity : AppCompatActivity() {
         return Bitmap.createScaledBitmap(source, newWidth, newHeight, true)
     }
 
+    // Placeholder for YUV Image to Bitmap conversion
+    // IMPORTANT: This is a simplified placeholder. A real implementation is needed for YUV to RGB.
+    private fun imageToBitmap(image: Image): Bitmap {
+        val width = image.width
+        val height = image.height
 
+        if (image.format == android.graphics.ImageFormat.YUV_420_888) {
+            val yBuffer = image.planes[0].buffer
+            val uBuffer = image.planes[1].buffer
+            val vBuffer = image.planes[2].buffer
 
-    // --- File Saving (Example: Save a Bitmap to Downloads) ---
-    // Note: For saving to public directories like Downloads on Android 10+ (API 29+),
-    // you should use MediaStore API for better scoped storage compliance.
-    // This is a simplified example.
+            val ySize = yBuffer.remaining()
+            val uSize = uBuffer.remaining()
+            val vSize = vBuffer.remaining()
+
+            val nv21 = ByteArray(ySize + uSize + vSize)
+            yBuffer.get(nv21, 0, ySize)
+            vBuffer.get(nv21, ySize, vSize)
+            uBuffer.get(nv21, ySize + vSize, uSize)
+
+            val yuvImage = android.graphics.YuvImage(nv21, android.graphics.ImageFormat.NV21, width, height, null)
+            val out = ByteArrayOutputStream()
+            yuvImage.compressToJpeg(android.graphics.Rect(0, 0, width, height), 90, out)
+            val imageBytes = out.toByteArray()
+            image.close()
+            return android.graphics.BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
+        } else {
+            Log.e("imageToBitmap", "Unsupported image format: ${image.format}. Needs specific handling.")
+            if (image.format == android.graphics.ImageFormat.FLEX_RGBA_8888 || image.planes.size == 1) {
+                val buffer = image.planes[0].buffer
+                val pixelStride = image.planes[0].pixelStride
+                val rowStride = image.planes[0].rowStride
+                val rowPadding = rowStride - pixelStride * width
+                val bitmap = Bitmap.createBitmap(width + rowPadding / pixelStride, height, Bitmap.Config.ARGB_8888)
+                bitmap.copyPixelsFromBuffer(buffer)
+                image.close()
+                if (rowPadding > 0) {
+                    val croppedBitmap = Bitmap.createBitmap(bitmap, 0, 0, width, height)
+                    bitmap.recycle()
+                    return croppedBitmap
+                }
+                return bitmap
+            }
+            image.close()
+            val errorBitmap = Bitmap.createBitmap(TARGET_LR_WIDTH_FOR_MODEL, TARGET_LR_HEIGHT, Bitmap.Config.ARGB_8888)
+            val canvas = Canvas(errorBitmap)
+            canvas.drawColor(android.graphics.Color.RED)
+            return errorBitmap
+        }
+    }
+
     private fun saveBitmapToDownloads(context: Context, bitmap: Bitmap, filename: String): String? {
         val directory = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
         if (!directory.exists()) {
@@ -481,13 +648,9 @@ class MainActivity : AppCompatActivity() {
         val file = File(directory, filename)
         try {
             FileOutputStream(file).use { out ->
-                bitmap.compress(Bitmap.CompressFormat.PNG, 100, out) // PNG is lossless
+                bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
             }
             Log.i("FileSave", "Bitmap saved to ${file.absolutePath}")
-
-            // Optionally, notify MediaScanner
-            // MediaScannerConnection.scanFile(context, arrayOf(file.toString()), null, null)
-
             return file.absolutePath
         } catch (e: IOException) {
             Log.e("FileSave", "Error saving bitmap", e)
@@ -495,8 +658,6 @@ class MainActivity : AppCompatActivity() {
         return null
     }
 
-    // Helper function to get absolute path from asset
-    @Throws(IOException::class)
     private fun assetFilePath(context: Context, assetName: String): String {
         val file = File(context.filesDir, assetName)
         if (file.exists() && file.length() > 0) {
@@ -505,7 +666,7 @@ class MainActivity : AppCompatActivity() {
 
         context.assets.open(assetName).use { inputStream ->
             FileOutputStream(file).use { outputStream ->
-                val buffer = ByteArray(4 * 1024) // 4k buffer
+                val buffer = ByteArray(4 * 1024)
                 var read: Int
                 while (inputStream.read(buffer).also { read = it } != -1) {
                     outputStream.write(buffer, 0, read)
@@ -517,7 +678,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun loadPyTorchModel() {
-        // If a module is already loaded for the *current* selectedDevice, do nothing.
         if (pytorchModule != null && currentModuleDevice == selectedDevice) {
             Log.i("MainActivity", "Model already loaded for $selectedDevice.")
             textViewStatus.text = "Model ready on $selectedDevice."
@@ -525,24 +685,21 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        // If there's an old module, destroy it (should be handled by spinner listener, but good failsafe)
         pytorchModule?.destroy()
         pytorchModule = null
 
         Log.i("MainActivity", "Attempting to load PyTorch model on $selectedDevice...")
         textViewStatus.text = "Loading model on $selectedDevice..."
-        buttonProcessVideo.isEnabled = false // Disable while loading
-        buttonSelectVideo.isEnabled = false // Disable while loading
+        buttonProcessVideo.isEnabled = false
+        buttonSelectVideo.isEnabled = false
 
         lifecycleScope.launch(Dispatchers.IO) {
             var success = false
             var errorMessage: String? = null
             try {
                 val modelPath = assetFilePath(this@MainActivity, modelAssetName)
-                // Use LiteModuleLoader
-//                pytorchModule = LiteModuleLoader.load(modelPath, null, selectedDevice)
-                pytorchModule = Module.load(modelPath,mutableMapOf<String, String>(), selectedDevice)
-                currentModuleDevice = selectedDevice // Store the device it was loaded on
+                pytorchModule = Module.load(modelPath, mutableMapOf<String, String>(), selectedDevice)
+                currentModuleDevice = selectedDevice
                 success = true
             } catch (e: Exception) {
                 currentModuleDevice = null
@@ -551,7 +708,7 @@ class MainActivity : AppCompatActivity() {
             }
 
             withContext(Dispatchers.Main) {
-                buttonSelectVideo.isEnabled = true // Re-enable select video button regardless of load outcome
+                buttonSelectVideo.isEnabled = true
                 if (success) {
                     Log.i("MainActivity", "PyTorch model loaded successfully on $selectedDevice.")
                     textViewStatus.text = "Model loaded on $selectedDevice. Ready."
@@ -561,17 +718,14 @@ class MainActivity : AppCompatActivity() {
                     Toast.makeText(this@MainActivity, "Model loading failed on $selectedDevice: ${errorMessage ?: "Unknown"}", Toast.LENGTH_LONG).show()
                     buttonProcessVideo.isEnabled = false
 
-                    // Fallback to CPU if a delegate (GPU/NPU) failed, but not if CPU itself failed
                     if (selectedDevice != Device.CPU) {
                         Log.w("MainActivity", "Falling back to CPU due to error on $selectedDevice.")
                         Toast.makeText(this@MainActivity, "Falling back to CPU.", Toast.LENGTH_SHORT).show()
 
-                        // Update selectedDevice and spinner without triggering listener again to prevent loop
                         selectedDevice = Device.CPU
                         spinnerDeviceSelection.setSelection(0, false)
-                        loadPyTorchModel() // Retry with CPU
+                        loadPyTorchModel()
                     } else {
-                        // CPU load failed
                         textViewStatus.text = "Failed to load model on CPU as well."
                     }
                 }
@@ -579,38 +733,32 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun checkPermissionAndOpenVideoPicker() {
+        val permission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            Manifest.permission.READ_MEDIA_VIDEO
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            Manifest.permission.READ_EXTERNAL_STORAGE
+        } else {
+            Manifest.permission.READ_EXTERNAL_STORAGE
+        }
 
-private fun checkPermissionAndOpenVideoPicker() {
-    val permission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) { // API 33+
-        Manifest.permission.READ_MEDIA_VIDEO
-    } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) { // Android 10 needs read for MediaStore access
-        Manifest.permission.READ_EXTERNAL_STORAGE
+        val writePermission = Manifest.permission.WRITE_EXTERNAL_STORAGE
+
+        val permissionsToRequest = mutableListOf<String>()
+        if (ContextCompat.checkSelfPermission(this, permission) != PackageManager.PERMISSION_GRANTED) {
+            permissionsToRequest.add(permission)
+        }
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q &&
+            ContextCompat.checkSelfPermission(this, writePermission) != PackageManager.PERMISSION_GRANTED) {
+            permissionsToRequest.add(writePermission)
+        }
+
+        if (permissionsToRequest.isEmpty()) {
+            openVideoPicker()
+        } else {
+            multiplePermissionsLauncher.launch(permissionsToRequest.toTypedArray())
+        }
     }
-    else { // Older versions
-        Manifest.permission.READ_EXTERNAL_STORAGE
-    }
-
-
-    val writePermission = Manifest.permission.WRITE_EXTERNAL_STORAGE
-
-    val permissionsToRequest = mutableListOf<String>()
-    if (ContextCompat.checkSelfPermission(this, permission) != PackageManager.PERMISSION_GRANTED) {
-        permissionsToRequest.add(permission)
-    }
-    // For saving to public Downloads on API < 29, you need WRITE_EXTERNAL_STORAGE
-    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q &&
-        ContextCompat.checkSelfPermission(this, writePermission) != PackageManager.PERMISSION_GRANTED) {
-        permissionsToRequest.add(writePermission)
-    }
-
-
-    if (permissionsToRequest.isEmpty()) {
-        openVideoPicker()
-    } else {
-        // Simplified: request all needed at once. Better UX would explain why.
-        multiplePermissionsLauncher.launch(permissionsToRequest.toTypedArray())
-    }
-}
 
     private val multiplePermissionsLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { permissions ->
@@ -629,14 +777,13 @@ private fun checkPermissionAndOpenVideoPicker() {
             }
         }
 
-    // ActivityResultLauncher for picking a video
     private val pickVideoLauncher: ActivityResultLauncher<Intent> =
         registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
             if (result.resultCode == Activity.RESULT_OK) {
                 result.data?.data?.let { uri ->
                     selectedVideoUri = uri
                     textViewSelectedVideo.text = "Selected: ${getFileName(uri)}"
-                    buttonProcessVideo.isEnabled = pytorchModule != null // Enable only if model is also loaded
+                    buttonProcessVideo.isEnabled = pytorchModule != null
                     Log.i("MainActivity", "Video selected: $uri")
                 } ?: run {
                     textViewSelectedVideo.text = "Failed to get video URI"
@@ -649,13 +796,9 @@ private fun checkPermissionAndOpenVideoPicker() {
 
     private fun openVideoPicker() {
         val intent = Intent(Intent.ACTION_PICK, MediaStore.Video.Media.EXTERNAL_CONTENT_URI)
-        // You could also use Intent.ACTION_GET_CONTENT and setType("video/*")
-        // val intent = Intent(Intent.ACTION_GET_CONTENT)
-        // intent.type = "video/*"
         pickVideoLauncher.launch(intent)
     }
 
-    // Helper function to get file name from URI (can be complex, simplified here)
     private fun getFileName(uri: Uri): String {
         var fileName: String? = null
         if (uri.scheme.equals("content")) {
@@ -681,7 +824,7 @@ private fun checkPermissionAndOpenVideoPicker() {
 
     override fun onDestroy() {
         super.onDestroy()
-        pytorchModule?.destroy() // CRITICAL: Release native resources
+        pytorchModule?.destroy()
         pytorchModule = null
     }
 }
