@@ -66,23 +66,7 @@ class MainActivity : AppCompatActivity() {
     private val modelAssetName = "lmf_cnn_mobile.ptl"
 
 
-    // ActivityResultLauncher for picking a video
-//    private val pickVideoLauncher: ActivityResultLauncher<Intent> =
-//        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
-//            if (result.resultCode == Activity.RESULT_OK) {
-//                result.data?.data?.let { uri ->
-//                    selectedVideoUri = uri
-//                    textViewSelectedVideo.text = "Selected: ${getFileName(uri)}"
-//                    buttonProcessVideo.isEnabled = true
-//                    Log.i("MainActivity", "Video selected: $uri")
-//                } ?: run {
-//                    textViewSelectedVideo.text = "Failed to get video URI"
-//                    buttonProcessVideo.isEnabled = false
-//                }
-//            } else {
-//                Log.i("MainActivity", "Video selection cancelled or failed")
-//            }
-//        }
+
 
     // ActivityResultLauncher for requesting permission
     private val requestPermissionLauncher: ActivityResultLauncher<String> =
@@ -135,6 +119,49 @@ class MainActivity : AppCompatActivity() {
         loadPyTorchModel()
     }
 
+
+    // Modify or add a new save function:
+    private fun saveBitmapToSpecificDirectory(context: Context, bitmap: Bitmap, directory: File, filename: String): String? {
+        val file = File(directory, filename)
+        try {
+            FileOutputStream(file).use { out ->
+                bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
+            }
+            Log.i("FileSave", "Bitmap saved to ${file.absolutePath}")
+            // Notify MediaScanner to make it visible in gallery apps quickly
+            // MediaScannerConnection.scanFile(context, arrayOf(file.toString()), null, null)
+            return file.absolutePath
+        } catch (e: IOException) {
+            Log.e("FileSave", "Error saving bitmap to ${file.absolutePath}", e)
+        }
+        return null
+    }
+
+    private fun resizeAndCenterPad(source: Bitmap, targetWidth: Int, targetHeight: Int, backgroundColor: Int = android.graphics.Color.BLACK): Bitmap {
+        val resultBitmap = Bitmap.createBitmap(targetWidth, targetHeight, source.config ?: Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(resultBitmap)
+        canvas.drawColor(backgroundColor) // Fill with background color
+
+        val sourceWidth = source.width
+        val sourceHeight = source.height
+
+        // Calculate scaling factor to fit the source bitmap into target dimensions
+        val xScale = targetWidth.toFloat() / sourceWidth
+        val yScale = targetHeight.toFloat() / sourceHeight
+        val scale = xScale.coerceAtMost(yScale) // Use the smaller scale factor (fit behavior)
+
+        val scaledWidth = scale * sourceWidth
+        val scaledHeight = scale * sourceHeight
+
+        // Calculate position to center the scaled image
+        val left = (targetWidth - scaledWidth) / 2f
+        val top = (targetHeight - scaledHeight) / 2f
+
+        val destRect = android.graphics.RectF(left, top, left + scaledWidth, top + scaledHeight)
+        canvas.drawBitmap(source, null, destRect, null) // Draw source onto the result bitmap, scaled and centered
+
+        return resultBitmap
+    }
 
     // --- Video Processing Core Logic (will be expanded) ---
     private suspend fun processVideo(videoUri: Uri) {
@@ -216,7 +243,7 @@ class MainActivity : AppCompatActivity() {
                         // We need to resize AND potentially crop to match 214x120.
                         // Let's resize to lrHeight (120) maintaining aspect, then center crop to TARGET_LR_WIDTH_FOR_MODEL (214).
                         val resizedLrBitmap = resizeBitmap(originalFrameBitmap, lrWidth, lrHeight)
-                        val modelInputLrBitmap = centerCropBitmap(resizedLrBitmap, TARGET_LR_WIDTH_FOR_MODEL, TARGET_LR_HEIGHT)
+                        val modelInputLrBitmap = resizeAndCenterPad(originalFrameBitmap!!, TARGET_LR_WIDTH_FOR_MODEL, TARGET_LR_HEIGHT)
                         originalFrameBitmap.recycle() // Important to free memory
                         resizedLrBitmap.recycle() // If different from modelInputLrBitmap
 
@@ -283,23 +310,33 @@ class MainActivity : AppCompatActivity() {
 
                             // Create a new bitmap for the output
                             val outputHrBitmap = Bitmap.createBitmap(outWidth, outHeight, Bitmap.Config.ARGB_8888)
-
+                            val intPixels = IntArray(outWidth * outHeight) // Array to hold ARGB pixel values
                             // Manually denormalize and fill bitmap pixels
                             // This is a bit verbose; TensorImageUtils might have a direct way for this too,
                             // but let's be explicit for denormalization.
                             // PyTorch tensor is CHW, Bitmap is row-major (Height then Width)
                             for (y in 0 until outHeight) {
                                 for (x in 0 until outWidth) {
-                                    val r = ((outputFloatTensor[(0 * outHeight + y) * outWidth + x] * 0.5f + 0.5f) * 255f).toInt().coerceIn(0, 255)
-                                    val g = ((outputFloatTensor[(1 * outHeight + y) * outWidth + x] * 0.5f + 0.5f) * 255f).toInt().coerceIn(0, 255)
-                                    val b = ((outputFloatTensor[(2 * outHeight + y) * outWidth + x] * 0.5f + 0.5f) * 255f).toInt().coerceIn(0, 255)
-                                    outputHrBitmap.setPixel(x, y, android.graphics.Color.rgb(r, g, b))
+                                    // Indices for R, G, B channels in the flat float array (CHW format)
+                                    val rIndex = (0 * outHeight + y) * outWidth + x
+                                    val gIndex = (1 * outHeight + y) * outWidth + x
+                                    val bIndex = (2 * outHeight + y) * outWidth + x
+
+                                    // Denormalize: from [-1, 1] to [0, 1], then to [0, 255]
+                                    val r = ((outputFloatTensor[rIndex] * 0.5f + 0.5f) * 255f).toInt().coerceIn(0, 255)
+                                    val g = ((outputFloatTensor[gIndex] * 0.5f + 0.5f) * 255f).toInt().coerceIn(0, 255)
+                                    val b = ((outputFloatTensor[bIndex] * 0.5f + 0.5f) * 255f).toInt().coerceIn(0, 255)
+
+                                    intPixels[y * outWidth + x] = android.graphics.Color.rgb(r, g, b) // Or Color.argb(255, r, g, b)
                                 }
                             }
+                            outputHrBitmap.setPixels(intPixels, 0, outWidth, 0, 0, outWidth, outHeight)
                             processedHrFrames.add(outputHrBitmap)
 
                             // Remove the oldest frame from the buffer to slide the window
-                            lrFrameBuffer.removeAt(0).recycle() // Recycle the removed bitmap
+//                            lrFrameBuffer.removeAt(0).recycle() // Recycle the removed bitmap
+                            val removedBitmap = lrFrameBuffer.removeAt(0)
+                            removedBitmap.recycle() // Recycle the removed bitmap
                             framesProcessed++
                             updateUiProgress((framesProcessed * 100) / totalFramesEstimate)
                         }
@@ -315,16 +352,29 @@ class MainActivity : AppCompatActivity() {
                     // Actual video saving is a significant step.
 
                     if (processedHrFrames.isNotEmpty()) {
-                        // For now, let's just save the first processed HR frame as an image to verify
-                        val firstHrFrame = processedHrFrames.first()
-                        val hrOutputPath = saveBitmapToDownloads(this@MainActivity, firstHrFrame, "first_processed_hr_frame.png")
-                        Log.i("ProcessVideo", "Saved first processed HR frame to: $hrOutputPath")
-                        updateUiStatus("Processing complete. First HR frame saved.")
-                        // TODO: Implement MediaMuxer to stitch all `processedHrFrames` into a video.
+                        updateUiStatus("Saving ${processedHrFrames.size} processed HR frames...")
+                        val outputDir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "LMF_CNN_Output")
+                        if (!outputDir.exists()) {
+                            outputDir.mkdirs()
+                        }
 
-                        // Clean up processed HR frames
+                        processedHrFrames.forEachIndexed { index, bmp ->
+                            val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+                            val fileName = "hr_frame_${timestamp}_${String.format("%03d", index)}.png"
+                            val savedPath = saveBitmapToSpecificDirectory(this@MainActivity, bmp, outputDir, fileName)
+                            if (savedPath != null) {
+                                Log.i("ProcessVideo", "Saved HR frame to: $savedPath")
+                            } else {
+                                Log.e("ProcessVideo", "Failed to save HR frame $index")
+                            }
+                            // bmp.recycle() // Recycle here if you don't need the bitmaps in memory anymore
+                        }
+                        updateUiStatus("${processedHrFrames.size} HR frames saved to Downloads/LMF_CNN_Output.")
+
+                        // Clean up processed HR frames if you are done with them
                         processedHrFrames.forEach { it.recycle() }
                         processedHrFrames.clear()
+
                     } else {
                         updateUiStatus("No frames were processed.")
                     }
@@ -378,22 +428,7 @@ class MainActivity : AppCompatActivity() {
         return Bitmap.createScaledBitmap(source, newWidth, newHeight, true)
     }
 
-    private fun centerCropBitmap(source: Bitmap, targetWidth: Int, targetHeight: Int): Bitmap {
-        val startX = (source.width - targetWidth) / 2
-        val startY = (source.height - targetHeight) / 2
 
-        // If source is already the target size or smaller in any dimension,
-        // it might be better to pad instead of crop, or ensure resizing handles this.
-        // For now, assume source is larger or equal to target.
-        if (startX < 0 || startY < 0 || targetWidth > source.width || targetHeight > source.height) {
-            Log.w("BitmapUtils", "Cannot crop. Source ($source.width x $source.height) too small for target ($targetWidth x $targetHeight). Returning resized instead.")
-            // Fallback: Resize to target, potentially distorting aspect if source wasn't correctly pre-sized.
-            // A better strategy might involve letterboxing/pillarboxing if aspect ratios differ.
-            return Bitmap.createScaledBitmap(source, targetWidth, targetHeight, true)
-
-        }
-        return Bitmap.createBitmap(source, startX, startY, targetWidth, targetHeight)
-    }
 
     // --- File Saving (Example: Save a Bitmap to Downloads) ---
     // Note: For saving to public directories like Downloads on Android 10+ (API 29+),
@@ -463,28 +498,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-//    private fun checkPermissionAndOpenVideoPicker() {
-//        val permission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) { // API 33+
-//            Manifest.permission.READ_MEDIA_VIDEO
-//        } else {
-//            Manifest.permission.READ_EXTERNAL_STORAGE
-//        }
-//
-//        when {
-//            ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED -> {
-//                openVideoPicker()
-//            }
-//            shouldShowRequestPermissionRationale(permission) -> {
-//                // Show an explanation to the user *asynchronously*
-//                // For simplicity, we'll just request again here, but in a real app, show a dialog.
-//                Toast.makeText(this, "Permission needed to access videos.", Toast.LENGTH_LONG).show()
-//                requestPermissionLauncher.launch(permission)
-//            }
-//            else -> {
-//                requestPermissionLauncher.launch(permission)
-//            }
-//        }
-//    }
+
 private fun checkPermissionAndOpenVideoPicker() {
     val permission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) { // API 33+
         Manifest.permission.READ_MEDIA_VIDEO
@@ -584,74 +598,5 @@ private fun checkPermissionAndOpenVideoPicker() {
         return fileName ?: "Unknown Video"
     }
 
-    // Placeholder for the actual video processing logic
-//    private fun startVideoProcessing(videoUri: Uri) {
-//        // This is where the heavy lifting will happen in later steps
-//        // For now, just log and update UI
-//        textViewStatus.text = "Starting processing..."
-//        progressBar.visibility = View.VISIBLE
-//        progressBar.isIndeterminate = true // Or set max and update progress later
-//
-//        // TODO: Next phase - Implement actual video processing logic here
-//        // This will involve:
-//        // 1. Frame extraction from videoUri
-//        // 2. Preprocessing each frame (or triplet of frames) into a Tensor
-//        // 3. Running inference: pytorchModule.forward(IValue.from(inputTensor)).toTensor()
-//        // 4. Postprocessing the output tensor back to an image/frame
-//        // 5. Re-stitching frames into an output video
-//        // All of this MUST happen on a background thread (e.g., Kotlin Coroutines)
-//
-//
-//        // Simulate some work for now
-//        buttonProcessVideo.isEnabled = false
-//        buttonSelectVideo.isEnabled = false
-//
-//        // In a real app, you'd use Kotlin Coroutines or an AsyncTask/ExecutorService here
-//        // For now, a simple Toast to indicate it's a placeholder
-//        Toast.makeText(this, "Video processing will happen here for $videoUri", Toast.LENGTH_LONG).show()
-//
-//        // Example of how you might update UI after (simulated) processing
-//        // This would be called from the background thread via runOnUiThread or similar
-//        // For now, we'll just reset after a delay to simulate completion
-//        progressBar.postDelayed({
-//            progressBar.visibility = View.GONE
-//            textViewStatus.text = "Processing (simulated) complete!"
-//            buttonProcessVideo.isEnabled = true
-//            buttonSelectVideo.isEnabled = true
-//        }, 5000) // Simulate 5 seconds of work
-//    }
-//}
 
-//    private fun startVideoProcessing(videoUri: Uri) {
-//        // Check if model is loaded
-//        if (pytorchModule == null) {
-//            Log.e("MainActivity", "Model is not loaded. Cannot process video.")
-//            Toast.makeText(this, "Model not available for processing.", Toast.LENGTH_LONG).show()
-//            return
-//        }
-//
-//        textViewStatus.text = "Starting processing..."
-//        progressBar.visibility = View.VISIBLE
-//        progressBar.isIndeterminate = true
-//        buttonProcessVideo.isEnabled = false
-//        buttonSelectVideo.isEnabled = false
-//
-//        // TODO: Next phase - Implement actual video processing logic here
-//        // This will involve:
-//        // 1. Frame extraction from videoUri
-//        // 2. Preprocessing each frame (or triplet of frames) into a Tensor
-//        // 3. Running inference: pytorchModule.forward(IValue.from(inputTensor)).toTensor()
-//        // 4. Postprocessing the output tensor back to an image/frame
-//        // 5. Re-stitching frames into an output video
-//        // All of this MUST happen on a background thread (e.g., Kotlin Coroutines)
-//
-//        Log.i("MainActivity", "Video processing logic to be implemented for: $videoUri")
-//
-//        progressBar.postDelayed({
-//            progressBar.visibility = View.GONE
-//            textViewStatus.text = "Processing (simulated) complete!"
-//            buttonProcessVideo.isEnabled = true
-//            buttonSelectVideo.isEnabled = true
-//        }, 5000)
-//    }
 }
