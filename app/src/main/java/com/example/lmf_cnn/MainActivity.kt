@@ -40,7 +40,11 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import kotlin.math.roundToInt
-
+import android.widget.AdapterView // For Spinner
+import android.widget.ArrayAdapter // For Spinner
+import android.widget.Spinner        // For Spinner
+import org.pytorch.Device
+//import org.pytorch.LiteModuleLoader
 
 // Constants for video processing
 private const val TARGET_LR_HEIGHT = 120
@@ -57,14 +61,15 @@ class MainActivity : AppCompatActivity() {
     private lateinit var buttonProcessVideo: Button
     private lateinit var progressBar: ProgressBar
     private lateinit var textViewStatus: TextView
-
+    private lateinit var spinnerDeviceSelection: Spinner // Declare Spinner
 
 
     private var selectedVideoUri: Uri? = null
 
     private var pytorchModule: Module? = null
     private val modelAssetName = "lmf_cnn_mobile.ptl"
-
+    private var selectedDevice: Device = Device.CPU // Default to CPU
+    private var currentModuleDevice: Device? = null // To track what device the current module is loaded on
 
 
 
@@ -89,6 +94,9 @@ class MainActivity : AppCompatActivity() {
         buttonProcessVideo = findViewById(R.id.buttonProcessVideo)
         progressBar = findViewById(R.id.progressBar)
         textViewStatus = findViewById(R.id.textViewStatus)
+        spinnerDeviceSelection = findViewById(R.id.spinnerDeviceSelection)
+
+        setupDeviceSpinner() // <-- Add this line to initialize the spinner
 
         buttonSelectVideo.setOnClickListener {
             checkPermissionAndOpenVideoPicker()
@@ -106,7 +114,7 @@ class MainActivity : AppCompatActivity() {
                 progressBar.visibility = View.VISIBLE
                 progressBar.isIndeterminate = false // We will set progress
                 progressBar.progress = 0
-                textViewStatus.text = "Starting processing..."
+                textViewStatus.text = "Starting processing on $selectedDevice..."
 
                 // Launch coroutine for video processing
                 lifecycleScope.launch {
@@ -120,6 +128,35 @@ class MainActivity : AppCompatActivity() {
     }
 
 
+    private fun setupDeviceSpinner() {
+        val devices = arrayOf("CPU", "GPU (Vulkan)" )
+        val adapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, devices)
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        spinnerDeviceSelection.adapter = adapter
+
+        spinnerDeviceSelection.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>, view: View?, position: Int, id: Long) {
+                val newSelectedDeviceEnum = when (position) {
+                    1 -> Device.VULKAN
+//                    2 -> Device.NNAPI
+                    else -> Device.CPU
+                }
+
+                if (newSelectedDeviceEnum != selectedDevice || pytorchModule == null) {
+                    selectedDevice = newSelectedDeviceEnum
+                    Log.i("MainActivity", "Device selection changed to: $selectedDevice. Re-loading model.")
+                    pytorchModule?.destroy() // Release previous module
+                    pytorchModule = null
+                    currentModuleDevice = null
+                    loadPyTorchModel() // Load with new device
+                }
+            }
+            override fun onNothingSelected(parent: AdapterView<*>) {}
+        }
+        // Set default selection (CPU), this will also trigger onItemSelected and initial model load
+        spinnerDeviceSelection.setSelection(0)
+    }
+
     // Modify or add a new save function:
     private fun saveBitmapToSpecificDirectory(context: Context, bitmap: Bitmap, directory: File, filename: String): String? {
         val file = File(directory, filename)
@@ -128,8 +165,6 @@ class MainActivity : AppCompatActivity() {
                 bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
             }
             Log.i("FileSave", "Bitmap saved to ${file.absolutePath}")
-            // Notify MediaScanner to make it visible in gallery apps quickly
-            // MediaScannerConnection.scanFile(context, arrayOf(file.toString()), null, null)
             return file.absolutePath
         } catch (e: IOException) {
             Log.e("FileSave", "Error saving bitmap to ${file.absolutePath}", e)
@@ -165,7 +200,7 @@ class MainActivity : AppCompatActivity() {
 
     // --- Video Processing Core Logic (will be expanded) ---
     private suspend fun processVideo(videoUri: Uri) {
-        Log.d("ProcessVideo", "Starting video processing for URI: $videoUri")
+        Log.d("ProcessVideo", "Starting video processing for URI: $videoUri  on $selectedDevice")
         var lrVideoPath: String? = null
         var hrVideoPath: String? = null
 
@@ -295,7 +330,11 @@ class MainActivity : AppCompatActivity() {
 
                             val inputTensor = Tensor.fromBlob(combinedFloats, longArrayOf(1, totalChannels.toLong(), h.toLong(), w.toLong()))
                             // --- Run Inference ---
+                            val startTime = System.nanoTime()
                             val outputTensor = pytorchModule!!.forward(IValue.from(inputTensor)).toTensor()
+                            val endTime = System.nanoTime()
+                            val durationMs = (endTime - startTime) / 1_000_000.0
+                            Log.d("Performance", "Inference for one triplet on $selectedDevice: $durationMs ms")
                             // Output tensor shape: [1, 3, H_out, W_out]
                             // H_out = 120 * 4 = 480, W_out = 214 * 4 = 856
 
@@ -478,21 +517,63 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun loadPyTorchModel() {
-        Log.i("MainActivity", "Attempting to load PyTorch model...")
-        textViewStatus.text = "Loading model..."
-        lifecycleScope.launch(Dispatchers.IO) { // Load model on background thread
+        // If a module is already loaded for the *current* selectedDevice, do nothing.
+        if (pytorchModule != null && currentModuleDevice == selectedDevice) {
+            Log.i("MainActivity", "Model already loaded for $selectedDevice.")
+            textViewStatus.text = "Model ready on $selectedDevice."
+            buttonProcessVideo.isEnabled = selectedVideoUri != null
+            return
+        }
+
+        // If there's an old module, destroy it (should be handled by spinner listener, but good failsafe)
+        pytorchModule?.destroy()
+        pytorchModule = null
+
+        Log.i("MainActivity", "Attempting to load PyTorch model on $selectedDevice...")
+        textViewStatus.text = "Loading model on $selectedDevice..."
+        buttonProcessVideo.isEnabled = false // Disable while loading
+        buttonSelectVideo.isEnabled = false // Disable while loading
+
+        lifecycleScope.launch(Dispatchers.IO) {
+            var success = false
+            var errorMessage: String? = null
             try {
                 val modelPath = assetFilePath(this@MainActivity, modelAssetName)
-                pytorchModule = Module.load(modelPath)
-                withContext(Dispatchers.Main) {
-                    Log.i("MainActivity", "PyTorch model loaded successfully from: $modelPath")
-                    textViewStatus.text = "Model loaded. Ready for video."
-                }
+                // Use LiteModuleLoader
+//                pytorchModule = LiteModuleLoader.load(modelPath, null, selectedDevice)
+                pytorchModule = Module.load(modelPath,mutableMapOf<String, String>(), selectedDevice)
+                currentModuleDevice = selectedDevice // Store the device it was loaded on
+                success = true
             } catch (e: Exception) {
-                Log.e("MainActivity", "Error loading PyTorch model", e)
-                withContext(Dispatchers.Main) {
-                    Toast.makeText(this@MainActivity, "PyTorch model loading failed: ${e.message}", Toast.LENGTH_LONG).show()
-                    textViewStatus.text = "Error loading model!"
+                currentModuleDevice = null
+                errorMessage = e.message
+                Log.e("MainActivity", "Error loading PyTorch model on $selectedDevice", e)
+            }
+
+            withContext(Dispatchers.Main) {
+                buttonSelectVideo.isEnabled = true // Re-enable select video button regardless of load outcome
+                if (success) {
+                    Log.i("MainActivity", "PyTorch model loaded successfully on $selectedDevice.")
+                    textViewStatus.text = "Model loaded on $selectedDevice. Ready."
+                    buttonProcessVideo.isEnabled = selectedVideoUri != null
+                } else {
+                    textViewStatus.text = "Error loading on $selectedDevice: ${errorMessage ?: "Unknown error"}"
+                    Toast.makeText(this@MainActivity, "Model loading failed on $selectedDevice: ${errorMessage ?: "Unknown"}", Toast.LENGTH_LONG).show()
+                    buttonProcessVideo.isEnabled = false
+
+                    // Fallback to CPU if a delegate (GPU/NPU) failed, but not if CPU itself failed
+                    if (selectedDevice != Device.CPU) {
+                        Log.w("MainActivity", "Falling back to CPU due to error on $selectedDevice.")
+                        Toast.makeText(this@MainActivity, "Falling back to CPU.", Toast.LENGTH_SHORT).show()
+
+                        // Update selectedDevice and spinner without triggering listener again to prevent loop
+                        selectedDevice = Device.CPU
+                        spinnerDeviceSelection.setSelection(0, false)
+                        loadPyTorchModel() // Retry with CPU
+                    } else {
+                        // CPU load failed
+                        textViewStatus.text = "Failed to load model on CPU as well."
+                    }
                 }
             }
         }
@@ -598,5 +679,9 @@ private fun checkPermissionAndOpenVideoPicker() {
         return fileName ?: "Unknown Video"
     }
 
-
+    override fun onDestroy() {
+        super.onDestroy()
+        pytorchModule?.destroy() // CRITICAL: Release native resources
+        pytorchModule = null
+    }
 }
